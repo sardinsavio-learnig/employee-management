@@ -1,25 +1,37 @@
+
 require("dotenv").config();
 
 const express = require("express");
-const { Pool } = require("pg");
+const mysql = require("mysql2/promise");
 const cors = require("cors");
 const helmet = require("helmet");
 
 const app = express();
-const PORT = Number(process.env.PORT || 5000);
+const PORT = Number(process.env.PORT || 3000);
 
-if (!process.env.DATABASE_URL) {
-  console.error("DATABASE_URL is missing from .env");
-  process.exit(1);
+// Validate required environment variables
+const requiredEnv = ["DB_HOST", "DB_USER", "DB_PASSWORD", "DB_NAME"];
+
+for (const key of requiredEnv) {
+  if (!process.env[key]) {
+    console.error(`${key} is missing from environment variables`);
+    process.exit(1);
+  }
 }
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  max: 10,
-  connectionTimeoutMillis: 5000,
-  idleTimeoutMillis: 30000
+// MySQL connection pool
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT || 3306),
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  connectTimeout: 5000
 });
 
+// CORS configuration
 const allowedOrigins = [
   process.env.FRONTEND_URL,
   "http://localhost:5173"
@@ -28,44 +40,35 @@ const allowedOrigins = [
 app.disable("x-powered-by");
 app.use(helmet());
 
-app.use(cors({
-  origin(origin, callback) {
-    if (!origin || allowedOrigins.includes(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error("Origin is not allowed by CORS"));
-  },
-  methods: ["GET", "POST", "PUT", "DELETE"],
-  allowedHeaders: ["Content-Type", "Authorization"]
-}));
+app.use(
+  cors({
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        return callback(null, true);
+      }
+
+      return callback(new Error("Origin is not allowed by CORS"));
+    },
+    methods: ["GET", "POST", "PUT", "DELETE"],
+    allowedHeaders: ["Content-Type", "Authorization"]
+  })
+);
 
 app.use(express.json({ limit: "20kb" }));
 
-async function initializeDatabase() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS employees (
-      id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-      name VARCHAR(120) NOT NULL,
-      email VARCHAR(255) NOT NULL UNIQUE,
-      department VARCHAR(100) NOT NULL,
-      position VARCHAR(120) NOT NULL,
-      salary NUMERIC(12,2) NOT NULL CHECK (salary >= 0),
-      status VARCHAR(20) NOT NULL DEFAULT 'Active'
-        CHECK (status IN ('Active', 'Inactive')),
-      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-}
-
+// Employee input validation
 function validateEmployee(body, partial = false) {
   if (!body || typeof body !== "object" || Array.isArray(body)) {
     return { error: "Request body must be a JSON object." };
   }
 
   const fields = [
-    "name", "email", "department",
-    "position", "salary", "status"
+    "name",
+    "email",
+    "department",
+    "position",
+    "salary",
+    "status"
   ];
 
   const data = {};
@@ -84,8 +87,11 @@ function validateEmployee(body, partial = false) {
   for (const field of ["name", "email", "department", "position"]) {
     if (data[field] !== undefined) {
       if (typeof data[field] !== "string" || !data[field].trim()) {
-        return { error: `${field} must be a non-empty string.` };
+        return {
+          error: `${field} must be a non-empty string.`
+        };
       }
+
       data[field] = data[field].trim();
     }
   }
@@ -105,13 +111,15 @@ function validateEmployee(body, partial = false) {
       !Number.isFinite(Number(data.salary)) ||
       Number(data.salary) < 0
     ) {
-      return { error: "Salary must be a non-negative number." };
+      return {
+        error: "Salary must be a non-negative number."
+      };
     }
 
     data.salary = Number(data.salary);
   }
 
-  if (data.status === undefined && !partial) {
+  if (!partial && data.status === undefined) {
     data.status = "Active";
   }
 
@@ -119,22 +127,32 @@ function validateEmployee(body, partial = false) {
     data.status !== undefined &&
     !["Active", "Inactive"].includes(data.status)
   ) {
-    return { error: "Status must be Active or Inactive." };
+    return {
+      error: "Status must be Active or Inactive."
+    };
   }
 
   return { data };
 }
 
+// Centralized error handling
 function handleError(res, error) {
   console.error(error);
 
-  if (error.code === "23505") {
+  if (error.code === "ER_DUP_ENTRY") {
     return res.status(409).json({
       message: "An employee with this email already exists."
     });
   }
 
-  if (["23514", "23502", "22P02"].includes(error.code)) {
+  if (
+    [
+      "ER_BAD_NULL_ERROR",
+      "ER_DATA_TOO_LONG",
+      "ER_TRUNCATED_WRONG_VALUE",
+      "ER_WARN_DATA_OUT_OF_RANGE"
+    ].includes(error.code)
+  ) {
     return res.status(400).json({
       message: "Invalid employee data."
     });
@@ -149,7 +167,11 @@ function handleError(res, error) {
 app.get("/api/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
-    res.json({ status: "ok", database: "connected" });
+
+    res.json({
+      status: "ok",
+      database: "connected"
+    });
   } catch (error) {
     handleError(res, error);
   }
@@ -158,20 +180,21 @@ app.get("/api/health", async (req, res) => {
 // List and search employees
 app.get("/api/employees", async (req, res) => {
   try {
-    const search = String(req.query.search || "").trim();
+    const pattern = `%${String(req.query.search || "").trim()}%`;
 
-    const result = await pool.query(
-      `SELECT *
+    const [rows] = await pool.query(
+      `SELECT id, name, email, department, position, salary,
+              status, joining_date
        FROM employees
-       WHERE name ILIKE $1
-          OR email ILIKE $1
-          OR department ILIKE $1
-          OR position ILIKE $1
+       WHERE name LIKE ?
+          OR email LIKE ?
+          OR department LIKE ?
+          OR position LIKE ?
        ORDER BY id DESC`,
-      [`%${search}%`]
+      [pattern, pattern, pattern, pattern]
     );
 
-    res.json(result.rows);
+    res.json(rows);
   } catch (error) {
     handleError(res, error);
   }
@@ -180,47 +203,68 @@ app.get("/api/employees", async (req, res) => {
 // Get one employee
 app.get("/api/employees/:id", async (req, res) => {
   if (!/^[1-9]\d*$/.test(req.params.id)) {
-    return res.status(400).json({ message: "Invalid employee ID." });
+    return res.status(400).json({
+      message: "Invalid employee ID."
+    });
   }
 
   try {
-    const result = await pool.query(
-      "SELECT * FROM employees WHERE id = $1",
+    const [rows] = await pool.query(
+      `SELECT id, name, email, department, position, salary,
+              status, joining_date
+       FROM employees
+       WHERE id = ?`,
       [req.params.id]
     );
 
-    if (!result.rowCount) {
-      return res.status(404).json({ message: "Employee not found." });
+    if (!rows.length) {
+      return res.status(404).json({
+        message: "Employee not found."
+      });
     }
 
-    res.json(result.rows[0]);
+    res.json(rows[0]);
   } catch (error) {
     handleError(res, error);
   }
 });
 
-// Create employee
+// Add employee
 app.post("/api/employees", async (req, res) => {
   const validation = validateEmployee(req.body);
 
   if (validation.error) {
-    return res.status(400).json({ message: validation.error });
+    return res.status(400).json({
+      message: validation.error
+    });
   }
 
   const {
-    name, email, department, position, salary, status
+    name,
+    email,
+    department,
+    position,
+    salary,
+    status
   } = validation.data;
 
   try {
-    const result = await pool.query(
+    const [result] = await pool.query(
       `INSERT INTO employees
        (name, email, department, position, salary, status)
-       VALUES ($1, $2, $3, $4, $5, $6)
-       RETURNING *`,
+       VALUES (?, ?, ?, ?, ?, ?)`,
       [name, email, department, position, salary, status]
     );
 
-    res.status(201).json(result.rows[0]);
+    const [rows] = await pool.query(
+      `SELECT id, name, email, department, position, salary,
+              status, joining_date
+       FROM employees
+       WHERE id = ?`,
+      [result.insertId]
+    );
+
+    res.status(201).json(rows[0]);
   } catch (error) {
     handleError(res, error);
   }
@@ -229,49 +273,61 @@ app.post("/api/employees", async (req, res) => {
 // Update employee
 app.put("/api/employees/:id", async (req, res) => {
   if (!/^[1-9]\d*$/.test(req.params.id)) {
-    return res.status(400).json({ message: "Invalid employee ID." });
+    return res.status(400).json({
+      message: "Invalid employee ID."
+    });
   }
 
   const validation = validateEmployee(req.body, true);
 
   if (validation.error) {
-    return res.status(400).json({ message: validation.error });
-  }
-
-  const allowed = new Set([
-    "name", "email", "department",
-    "position", "salary", "status"
-  ]);
-
-  const fields = Object.keys(validation.data);
-
-  if (!fields.length || fields.some(field => !allowed.has(field))) {
     return res.status(400).json({
-      message: "Provide valid fields to update."
+      message: validation.error
     });
   }
 
-  const values = fields.map(field => validation.data[field]);
-  const assignments = fields.map(
-    (field, index) => `${field} = $${index + 1}`
-  );
+  const fields = Object.keys(validation.data);
 
-  values.push(req.params.id);
+  if (!fields.length) {
+    return res.status(400).json({
+      message: "Provide fields to update."
+    });
+  }
 
   try {
-    const result = await pool.query(
-      `UPDATE employees
-       SET ${assignments.join(", ")}, updated_at = NOW()
-       WHERE id = $${values.length}
-       RETURNING *`,
-      values
+    const [existing] = await pool.query(
+      "SELECT id FROM employees WHERE id = ?",
+      [req.params.id]
     );
 
-    if (!result.rowCount) {
-      return res.status(404).json({ message: "Employee not found." });
+    if (!existing.length) {
+      return res.status(404).json({
+        message: "Employee not found."
+      });
     }
 
-    res.json(result.rows[0]);
+    const assignments = fields
+      .map(field => `${field} = ?`)
+      .join(", ");
+
+    const values = fields.map(
+      field => validation.data[field]
+    );
+
+    await pool.query(
+      `UPDATE employees SET ${assignments} WHERE id = ?`,
+      [...values, req.params.id]
+    );
+
+    const [rows] = await pool.query(
+      `SELECT id, name, email, department, position, salary,
+              status, joining_date
+       FROM employees
+       WHERE id = ?`,
+      [req.params.id]
+    );
+
+    res.json(rows[0]);
   } catch (error) {
     handleError(res, error);
   }
@@ -280,46 +336,60 @@ app.put("/api/employees/:id", async (req, res) => {
 // Delete employee
 app.delete("/api/employees/:id", async (req, res) => {
   if (!/^[1-9]\d*$/.test(req.params.id)) {
-    return res.status(400).json({ message: "Invalid employee ID." });
+    return res.status(400).json({
+      message: "Invalid employee ID."
+    });
   }
 
   try {
-    const result = await pool.query(
-      "DELETE FROM employees WHERE id = $1 RETURNING id",
+    const [result] = await pool.query(
+      "DELETE FROM employees WHERE id = ?",
       [req.params.id]
     );
 
-    if (!result.rowCount) {
-      return res.status(404).json({ message: "Employee not found." });
+    if (!result.affectedRows) {
+      return res.status(404).json({
+        message: "Employee not found."
+      });
     }
 
-    res.json({ message: "Employee deleted successfully." });
+    res.json({
+      message: "Employee deleted successfully."
+    });
   } catch (error) {
     handleError(res, error);
   }
 });
 
+// Error handling middleware
 app.use((err, req, res, next) => {
   if (err.message === "Origin is not allowed by CORS") {
-    return res.status(403).json({ message: "Origin is not allowed." });
+    return res.status(403).json({
+      message: "Origin is not allowed."
+    });
   }
 
   if (err instanceof SyntaxError && "body" in err) {
-    return res.status(400).json({ message: "Invalid JSON body." });
+    return res.status(400).json({
+      message: "Invalid JSON body."
+    });
   }
 
   console.error(err);
-  res.status(500).json({ message: "Internal server error." });
+
+  res.status(500).json({
+    message: "Internal server error."
+  });
 });
 
+// Start the API only after MySQL is reachable
 async function startServer() {
   try {
-    await initializeDatabase();
     await pool.query("SELECT 1");
 
-    app.listen(PORT, "127.0.0.1", () => {
-      console.log(`Employee API listening on 127.0.0.1:${PORT}`);
-      console.log("PostgreSQL connected successfully.");
+    app.listen(PORT, "0.0.0.0", () => {
+      console.log(`Employee API listening on port ${PORT}`);
+      console.log("MySQL connected successfully.");
     });
   } catch (error) {
     console.error("Failed to start:", error.message);
@@ -329,10 +399,17 @@ async function startServer() {
 
 startServer();
 
+// Graceful shutdown
 async function shutdown() {
-  await pool.end();
-  process.exit(0);
+  try {
+    await pool.end();
+  } catch (error) {
+    console.error("Error closing MySQL pool:", error.message);
+  } finally {
+    process.exit(0);
+  }
 }
 
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);
+
